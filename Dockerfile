@@ -28,7 +28,7 @@ LABEL org.opencontainers.image.title="Discord to Keycloak Role Sync"
 LABEL org.opencontainers.image.description="Synchronises membership of Discord roles to Keycloak groups"
 LABEL org.opencontainers.image.authors="Ike Johnson-Woods <contact@ike.au>"
 
-LABEL org.opencontainers.image.source=https://github.com/NotActuallyTerry/discord-keycloak-rolesync
+LABEL org.opencontainers.image.source=https://github.com/HackUCF/discord-keycloak-rolesync
 LABEL org.opencontainers.image.license=MPL-2.0
 
 COPY --from=builder-pipenv /app/.venv/ /venv/

@@ -1,6 +1,6 @@
 services:
   discord-keycloak-rolesync:
-    image: NotActuallyTerry/discord-keycloak-rolesync
+    image: ghcr.io/hackucf/discord-keycloak-rolesync:latest
     build:
       context: .
     environment:
