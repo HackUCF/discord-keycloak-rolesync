@@ -32,7 +32,7 @@ LABEL org.opencontainers.image.source=https://github.com/NotActuallyTerry/discor
 LABEL org.opencontainers.image.license=MPL-2.0
 
 COPY --from=builder-pipenv /app/.venv/ /venv/
-COPY app.py /app/app.py
+COPY app.py config.py /app/
 WORKDIR /app
 
 ENTRYPOINT ["/venv/bin/python", "app.py"]
