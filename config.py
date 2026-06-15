@@ -39,10 +39,7 @@ class GrantConfig:
         return bool(actor_group_paths & granters)
 
 
-def load_grant_config(
-        path: str = None,
-        client: KeycloakAdmin = None,
-        linked_group_paths: set[str] = None) -> GrantConfig:
+def load_grant_config(path: str = None, client: KeycloakAdmin = None) -> GrantConfig:
     """
     Load and validate the YAML grant config.
 
@@ -50,14 +47,14 @@ def load_grant_config(
     malformed rule can't take the whole bot down. Each grantable group's UUID is
     resolved here so command handlers don't have to look it up on every call.
 
+    A grantable group may also be role-synced (carry a discord-role attribute):
+    since Keycloak is the system of record, granting writes group membership and
+    the projection then applies the linked Discord role. The two compose.
+
     :param path: Path to the YAML config file (from the GRANTS_CONFIG env var)
     :param client: A :class:`KeycloakAdmin` client used to resolve group paths
-    :param linked_group_paths: Paths of role-synced groups, used to enforce that a
-        group is either role-synced or grant-managed, never both
     :rtype: GrantConfig
     """
-
-    linked_group_paths = linked_group_paths or set()
 
     if not path:
         logger.warning("GRANTS_CONFIG is not set; no groups will be grantable")
@@ -78,17 +75,12 @@ def load_grant_config(
         granted_by = entry.get("granted_by") or []
 
         if not group or not granted_by:
-            logger.warning("Skipping grant entry missing 'group' or 'granted_by': %r", entry)
+            logger.warning(
+                "Skipping grant entry missing 'group' or 'granted_by': %r", entry
+            )
             continue
 
         group = _normalize_path(group)
-
-        # Enforce decision #1: a group is either role-synced or grant-managed
-        if group in linked_group_paths:
-            logger.warning(
-                "Skipping grant group %s: it is role-synced (has discord-role); "
-                "a group must be either role-synced or grant-managed, not both", group)
-            continue
 
         group_id = _resolve_group_id(client, group)
         if group_id is None:

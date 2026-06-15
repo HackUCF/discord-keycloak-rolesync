@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -9,17 +11,36 @@ from keycloak import KeycloakAdmin
 
 from config import GrantConfig, load_grant_config
 
-
 # How often (minutes) to reconcile Discord roles against Keycloak group membership.
 # Keycloak can't push membership-change events, so we poll to project its state onto Discord.
 SYNC_INTERVAL_MINUTES = int(os.environ.get("GROUP_SYNC_INTERVAL_MINUTES", "5"))
 
 
-dt_fmt = '%Y-%m-%d %H:%M:%S'
-formatter = logging.Formatter('[{asctime}] [{levelname:<8}] {name}: {message}', dt_fmt, style='{')
+class JsonFormatter(logging.Formatter):
+    """Emit one JSON object per log record. Audit fields passed via extra= are merged in."""
+
+    _AUDIT_FIELDS = (
+        "event", "trigger", "outcome",
+        "actor", "target", "group", "role", "guild_id",
+        "error",
+    )
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+        }
+        for field in self._AUDIT_FIELDS:
+            if hasattr(record, field):
+                entry[field] = getattr(record, field)
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry)
+
 
 handler = logging.StreamHandler()
-handler.setFormatter(formatter)
+handler.setFormatter(JsonFormatter())
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -27,11 +48,12 @@ logger.addHandler(handler)
 
 
 KeycloakClient = KeycloakAdmin(
-            server_url=os.environ["KEYCLOAK_URL"],
-            username=os.environ["KEYCLOAK_USERNAME"],
-            password=os.environ["KEYCLOAK_PASSWORD"],
-            realm_name=os.environ["KEYCLOAK_REALM"],
-            user_realm_name=os.environ["KEYCLOAK_ADMIN_REALM"])
+    server_url=os.environ["KEYCLOAK_URL"],
+    username=os.environ["KEYCLOAK_USERNAME"],
+    password=os.environ["KEYCLOAK_PASSWORD"],
+    realm_name=os.environ["KEYCLOAK_REALM"],
+    user_realm_name=os.environ["KEYCLOAK_ADMIN_REALM"],
+)
 
 
 # We require the Members intent to receive updates to role membership
@@ -67,9 +89,7 @@ def get_linked_groups(client: KeycloakAdmin = None) -> list:
     # We're setting briefRepresentation to false, so it'll return the groups' attributes
     # These will be useful later on
     groups = client.get_groups(
-        query={"briefRepresentation": "false",
-               "first": page_start,
-               "max": page_size}
+        query={"briefRepresentation": "false", "first": page_start, "max": page_size}
     )
     all_groups += groups
 
@@ -79,9 +99,11 @@ def get_linked_groups(client: KeycloakAdmin = None) -> list:
     while len(groups) == page_size:
         page_start += page_size
         groups = client.get_groups(
-            query={"briefRepresentation": "false",
-                   "first": page_start,
-                   "max": page_size}
+            query={
+                "briefRepresentation": "false",
+                "first": page_start,
+                "max": page_size,
+            }
         )
         all_groups += groups
 
@@ -90,10 +112,12 @@ def get_linked_groups(client: KeycloakAdmin = None) -> list:
 
     for group in all_groups:
         try:
-            if group["attributes"]["discord-guild"] and group["attributes"]["discord-role"]:
+            if (
+                group["attributes"]["discord-guild"]
+                and group["attributes"]["discord-role"]
+            ):
                 valid_groups.append(group)
         except KeyError:
-
             # If the group doesn't have the required attributes, it'll throw a KeyError
             # We can just catch and kill the error :)
             pass
@@ -101,7 +125,9 @@ def get_linked_groups(client: KeycloakAdmin = None) -> list:
     return valid_groups
 
 
-def get_linked_role(client: discord.client.Client = None, group: dict = None) -> discord.Role | None:
+def get_linked_role(
+    client: discord.client.Client = None, group: dict = None
+) -> discord.Role | None:
     """
     Get the Discord role that is linked to a Keycloak group
     :param client: A Discord Client instance
@@ -133,63 +159,72 @@ def get_group_members(client: KeycloakAdmin = None, group_id: str = None) -> lis
     :return: A :class:`list` containing all users in the group
     """
 
-    # See comments in the get_linked_groups function for how we're handling Keycloak's Admin API pagination
+    # See comments in the get_linked_groups function for how we're handling Keycloak's Admin API pagination.
+    # briefRepresentation=false makes the endpoint return each member's attributes
+    # (incl. discord_id) inline, so we don't have to fetch every user individually.
     page_start = 0
     page_size = 100
     members = []
 
-    group_members = client.get_group_members(
-        group_id=group_id,
-        query={"first": page_start, "max": page_size}
-    )
+    def page(first):
+        return client.get_group_members(
+            group_id=group_id,
+            query={"briefRepresentation": "false", "first": first, "max": page_size},
+        )
+
+    group_members = page(page_start)
     members += group_members
 
     while len(group_members) == page_size:
         page_start += page_size
-        group_members = client.get_group_members(
-            group_id=group_id,
-            query={"first": page_start, "max": page_size}
-        )
+        group_members = page(page_start)
         members += group_members
 
     return members
 
 
-def get_discord_id(client: KeycloakAdmin = None, user_id: str = None) -> int:
+def get_discord_id(user: dict = None) -> int:
     """
-    Gets the Discord ID from the user's Keycloak profile
-    This only works if the Keycloak realm has Discord set up
-    as an Identity provider.
-    :param client: A KeycloakAdmin client
-    :param user_id: The user's UUID in Keycloak
+    Read the Discord ID from a Keycloak user representation's `discord_id`
+    attribute. The user dict must be a full representation (briefRepresentation
+    false), as returned by get_group_members and get_user.
+    :param user: A Keycloak user representation
     :rtype: int
     :return: The user's Discord ID
     """
 
-    profile = client.get_user(user_id=user_id)
-    discord_id = None
+    values = (user.get("attributes") or {}).get("discord_id")
 
-    for provider in profile["federatedIdentities"]:
-        if provider["identityProvider"] == "discord":
-            discord_id = provider["userId"]
+    if not values:
+        raise Exception("User has no discord_id attribute")
 
-    if not discord_id:
-        raise Exception("Cannot find Github username")
-
-    return int(discord_id)
+    return int(values[0])
 
 
 def lookup_keycloak_user(discord_id: int) -> dict | None:
     """
-    Find the Keycloak user federated to a given Discord ID.
+    Find the Keycloak user whose `discord_id` attribute matches a Discord ID.
+
+    The `q` search is pinned to an exact match: without it Keycloak does a
+    substring search, so a short Discord ID could match the wrong account. Since
+    this is the authorization anchor for the grant commands, an ambiguous result
+    (more than one match) is treated as no match rather than trusting users[0].
+
     :param discord_id: The user's Discord ID
     :rtype: dict | None
-    :return: The Keycloak user, or None if there's no linked account
+    :return: The Keycloak user, or None if there's no unambiguous matching account
     """
 
     users = KeycloakClient.get_users(
-        query={"idpUserId": discord_id, "idpAlias": "discord"})
-    return users[0] if users else None
+        query={"q": "discord_id:%s" % discord_id, "exact": "true"}
+    )
+    if len(users) != 1:
+        if len(users) > 1:
+            logger.warning(
+                "Ambiguous Keycloak lookup for discord_id %s: %d users matched",
+                discord_id, len(users))
+        return None
+    return users[0]
 
 
 def get_user_group_paths(user_id: str) -> set[str]:
@@ -212,7 +247,8 @@ def get_group_by_discord_role(role_id: int) -> dict | None:
     """
 
     groups = KeycloakClient.get_groups(
-        query={"q": "discord-role:%s" % role_id, "exact": "true"})
+        query={"q": "discord-role:%s" % role_id, "exact": "true"}
+    )
     return groups[0] if groups else None
 
 
@@ -239,7 +275,7 @@ def get_group_discord_ids(group_id: str) -> set[int]:
     discord_ids = set()
     for member in get_group_members(client=KeycloakClient, group_id=group_id):
         try:
-            discord_ids.add(get_discord_id(client=KeycloakClient, user_id=member["id"]))
+            discord_ids.add(get_discord_id(user=member))
         except Exception:
             # No linked Discord identity; nothing we can project onto Discord
             continue
@@ -268,7 +304,10 @@ async def reconcile_groups() -> list[dict]:
         if not role:
             continue
 
-        logger.info('Reconciling Keycloak group %s onto Discord role %s', group["name"], role.name)
+        logger.info(
+            "Reconciling Keycloak group %s onto Discord role %s",
+            group["name"], role.name,
+        )
         desired_ids = await asyncio.to_thread(get_group_discord_ids, group["id"])
 
         # Add the role to group members who don't have it yet
@@ -277,22 +316,70 @@ async def reconcile_groups() -> list[dict]:
             if member is None or role in member.roles:
                 continue
             try:
-                await member.add_roles(role, reason="In Keycloak group %s" % group["name"])
-                logger.info('Granted role %s to %s (in Keycloak group %s)',
-                            role.name, member.name, group["name"])
+                await member.add_roles(
+                    role, reason="In Keycloak group %s" % group["name"]
+                )
+                logger.info(
+                    "Granted role %s to %s", role.name, member.name,
+                    extra={
+                        "event": "role_granted",
+                        "trigger": "reconcile",
+                        "outcome": "success",
+                        "target": {"discord_id": member.id, "discord_name": member.name},
+                        "role": {"id": role.id, "name": role.name},
+                        "group": {"path": group.get("path"), "name": group["name"]},
+                        "guild_id": role.guild.id,
+                    },
+                )
             except discord.HTTPException as e:
-                logger.warning('Could not grant role %s to %s: %s', role.name, member.name, e)
+                logger.warning(
+                    "Could not grant role %s to %s: %s", role.name, member.name, e,
+                    extra={
+                        "event": "role_granted",
+                        "trigger": "reconcile",
+                        "outcome": "failure",
+                        "target": {"discord_id": member.id, "discord_name": member.name},
+                        "role": {"id": role.id, "name": role.name},
+                        "group": {"path": group.get("path"), "name": group["name"]},
+                        "guild_id": role.guild.id,
+                        "error": str(e),
+                    },
+                )
 
         # Remove the role from anyone who holds it but isn't in the group
         for member in list(role.members):
             if member.id in desired_ids:
                 continue
             try:
-                await member.remove_roles(role, reason="Not in Keycloak group %s" % group["name"])
-                logger.info('Removed role %s from %s (not in Keycloak group %s)',
-                            role.name, member.name, group["name"])
+                await member.remove_roles(
+                    role, reason="Not in Keycloak group %s" % group["name"]
+                )
+                logger.info(
+                    "Removed role %s from %s", role.name, member.name,
+                    extra={
+                        "event": "role_revoked",
+                        "trigger": "reconcile",
+                        "outcome": "success",
+                        "target": {"discord_id": member.id, "discord_name": member.name},
+                        "role": {"id": role.id, "name": role.name},
+                        "group": {"path": group.get("path"), "name": group["name"]},
+                        "guild_id": role.guild.id,
+                    },
+                )
             except discord.HTTPException as e:
-                logger.warning('Could not remove role %s from %s: %s', role.name, member.name, e)
+                logger.warning(
+                    "Could not remove role %s from %s: %s", role.name, member.name, e,
+                    extra={
+                        "event": "role_revoked",
+                        "trigger": "reconcile",
+                        "outcome": "failure",
+                        "target": {"discord_id": member.id, "discord_name": member.name},
+                        "role": {"id": role.id, "name": role.name},
+                        "group": {"path": group.get("path"), "name": group["name"]},
+                        "guild_id": role.guild.id,
+                        "error": str(e),
+                    },
+                )
 
     return groups
 
@@ -308,19 +395,17 @@ async def group_sync_loop():
 
 @DiscordClient.event
 async def on_ready():
-    logger.info(f'We have logged in as {DiscordClient.user}')
+    logger.info("Logged in as %s", DiscordClient.user)
 
-    groups = await reconcile_groups()
-    linked_group_paths = {group["path"] for group in groups}
+    await reconcile_groups()
 
-    # Load the grant rules now that we know which groups are role-synced, then
-    # register the slash commands. Both are guarded to run only once, since
-    # on_ready can fire again on reconnects.
+    # Load the grant rules, then register the slash commands. Both are guarded to
+    # run only once, since on_ready can fire again on reconnects.
     global GrantRules, _commands_synced
     GrantRules = load_grant_config(
         path=os.environ.get("GRANTS_CONFIG"),
         client=KeycloakClient,
-        linked_group_paths=linked_group_paths)
+    )
 
     if not _commands_synced:
         await DiscordClient.tree.sync()
@@ -359,28 +444,86 @@ async def on_member_update(previous, current):
         if group is None:
             continue  # not a role-synced group; not ours to manage
 
-        in_group = await asyncio.to_thread(is_group_member, keycloak_user["id"], group["id"])
+        in_group = await asyncio.to_thread(
+            is_group_member, keycloak_user["id"], group["id"]
+        )
         has_role = role.id in current_role_ids
+
+        target_info = {
+            "discord_id": current.id,
+            "discord_name": current.name,
+            "kc_id": keycloak_user["id"],
+        }
+        role_info = {"id": role.id, "name": role.name}
+        group_info = {"path": group.get("path"), "name": group["name"]}
 
         if in_group and not has_role:
             try:
-                await current.add_roles(role, reason="In Keycloak group %s (restored)" % group["name"])
-                logger.info('Restored role %s to %s (in Keycloak group %s)',
-                            role.name, current.name, group["name"])
+                await current.add_roles(
+                    role, reason="In Keycloak group %s (restored)" % group["name"]
+                )
+                logger.warning(
+                    "Restored role %s to %s — was removed out of band", role.name, current.name,
+                    extra={
+                        "event": "role_restored",
+                        "trigger": "revert",
+                        "outcome": "success",
+                        "target": target_info,
+                        "role": role_info,
+                        "group": group_info,
+                        "guild_id": current.guild.id,
+                    },
+                )
             except discord.HTTPException as e:
-                logger.warning('Could not restore role %s to %s: %s', role.name, current.name, e)
+                logger.warning(
+                    "Could not restore role %s to %s: %s", role.name, current.name, e,
+                    extra={
+                        "event": "role_restored",
+                        "trigger": "revert",
+                        "outcome": "failure",
+                        "target": target_info,
+                        "role": role_info,
+                        "group": group_info,
+                        "guild_id": current.guild.id,
+                        "error": str(e),
+                    },
+                )
         elif has_role and not in_group:
             try:
-                await current.remove_roles(role, reason="Not in Keycloak group %s (reverted)" % group["name"])
-                logger.info('Reverted role %s from %s (not in Keycloak group %s)',
-                            role.name, current.name, group["name"])
+                await current.remove_roles(
+                    role, reason="Not in Keycloak group %s (reverted)" % group["name"]
+                )
+                logger.warning(
+                    "Reverted role %s from %s — was added out of band", role.name, current.name,
+                    extra={
+                        "event": "role_reverted",
+                        "trigger": "revert",
+                        "outcome": "success",
+                        "target": target_info,
+                        "role": role_info,
+                        "group": group_info,
+                        "guild_id": current.guild.id,
+                    },
+                )
             except discord.HTTPException as e:
-                logger.warning('Could not revert role %s from %s: %s', role.name, current.name, e)
+                logger.warning(
+                    "Could not revert role %s from %s: %s", role.name, current.name, e,
+                    extra={
+                        "event": "role_reverted",
+                        "trigger": "revert",
+                        "outcome": "failure",
+                        "target": target_info,
+                        "role": role_info,
+                        "group": group_info,
+                        "guild_id": current.guild.id,
+                        "error": str(e),
+                    },
+                )
 
 
 async def group_autocomplete(
-        interaction: discord.Interaction,
-        current: str) -> list[app_commands.Choice[str]]:
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
     """
     Suggest grantable group paths. Authorization is enforced when the command
     runs, not here, to keep autocomplete responsive (no per-keystroke Keycloak
@@ -398,6 +541,79 @@ async def group_autocomplete(
     ][:25]
 
 
+def get_group(group_id: str) -> dict | None:
+    """Fetch a single Keycloak group (full representation, incl. attributes)."""
+    try:
+        return KeycloakClient.get_group(group_id=group_id)
+    except Exception:
+        return None
+
+
+async def apply_linked_role(group_id: str, user: discord.User, add: bool) -> str:
+    """
+    If the Keycloak group is role-synced, add/remove its linked Discord role on
+    the user right away, so a grant/revoke is reflected immediately instead of
+    waiting for the next reconcile poll. Best-effort: a grant-managed-only group,
+    an unknown guild member, or a Discord error is a logged no-op, never raised.
+
+    Returns a short note describing what happened to the Discord role (empty when
+    the group has no linked role), so the command can append it to its reply.
+    """
+
+    group = await asyncio.to_thread(get_group, group_id)
+    if not group:
+        return ""
+
+    attributes = group.get("attributes") or {}
+    if "discord-role" not in attributes or "discord-guild" not in attributes:
+        return ""  # grant-managed only; no Discord role to project
+
+    role = get_linked_role(client=DiscordClient, group=group)
+    if role is None:
+        return " (its linked Discord role couldn't be found)"
+
+    member = role.guild.get_member(user.id)
+    if member is None:
+        return f" (couldn't update the **{role.name}** role: user isn't in {role.guild.name})"
+
+    event = "role_granted" if add else "role_revoked"
+    verb = "Granted" if add else "Revoked"
+    try:
+        if add:
+            await member.add_roles(role, reason="%s Keycloak group %s" % (verb, group["name"]))
+        else:
+            await member.remove_roles(role, reason="%s Keycloak group %s" % (verb, group["name"]))
+        logger.info(
+            "%s linked role %s for %s", verb, role.name, member.name,
+            extra={
+                "event": event,
+                "trigger": "command",
+                "outcome": "success",
+                "target": {"discord_id": member.id, "discord_name": member.name},
+                "role": {"id": role.id, "name": role.name},
+                "group": {"path": group.get("path"), "name": group["name"]},
+                "guild_id": role.guild.id,
+            },
+        )
+        return f" and {'assigned' if add else 'removed'} the **{role.name}** Discord role"
+    except discord.HTTPException as e:
+        logger.warning(
+            "Could not apply linked role %s for %s: %s", role.name, user, e,
+            extra={
+                "event": event,
+                "trigger": "command",
+                "outcome": "failure",
+                "target": {"discord_id": user.id, "discord_name": str(user)},
+                "role": {"id": role.id, "name": role.name},
+                "group": {"path": group.get("path"), "name": group["name"]},
+                "guild_id": role.guild.id,
+                "error": str(e),
+            },
+        )
+        action = "assign" if add else "remove"
+        return f" (⚠️ couldn't {action} the **{role.name}** role: {e.text or e})"
+
+
 @DiscordClient.tree.command(name="grant", description="Add a user to a Keycloak group")
 @app_commands.describe(user="The user to add", group="The Keycloak group to grant")
 @app_commands.autocomplete(group=group_autocomplete)
@@ -405,7 +621,9 @@ async def grant(interaction: discord.Interaction, user: discord.User, group: str
     await interaction.response.defer(ephemeral=True)
 
     if GrantRules is None:
-        await interaction.followup.send("Grant rules aren't loaded yet, try again shortly.")
+        await interaction.followup.send(
+            "Grant rules aren't loaded yet, try again shortly."
+        )
         return
 
     if group not in GrantRules.rules:
@@ -419,32 +637,73 @@ async def grant(interaction: discord.Interaction, user: discord.User, group: str
 
     actor_groups = await asyncio.to_thread(get_user_group_paths, actor["id"])
     if not GrantRules.can_grant(actor_groups, group):
+        logger.warning(
+            "%s attempted to grant %s but is not authorized",
+            interaction.user.name, group,
+            extra={
+                "event": "authz_denied",
+                "trigger": "command",
+                "actor": {
+                    "discord_id": interaction.user.id,
+                    "discord_name": interaction.user.name,
+                    "kc_id": actor["id"],
+                    "kc_username": actor["username"],
+                },
+                "group": {"path": group},
+            },
+        )
         await interaction.followup.send(f"You're not authorized to grant `{group}`.")
         return
 
     target = await asyncio.to_thread(lookup_keycloak_user, user.id)
     if target is None:
         await interaction.followup.send(
-            f"{user.mention} has no linked Keycloak account; they need to sign in via Discord SSO first.")
+            f"{user.mention} has no linked Keycloak account; they need to sign in via Discord SSO first."
+        )
         return
 
     group_id = GrantRules.group_ids[group]
     await asyncio.to_thread(
-        KeycloakClient.group_user_add, user_id=target["id"], group_id=group_id)
+        KeycloakClient.group_user_add, user_id=target["id"], group_id=group_id
+    )
+    role_note = await apply_linked_role(group_id, user, add=True)
 
-    logger.info("%s (%s) granted %s to %s (%s)",
-                actor["username"], interaction.user.name, group, target["username"], user.name)
-    await interaction.followup.send(f"Added {user.mention} to `{group}`.")
+    logger.info(
+        "%s granted %s to %s", actor["username"], group, target["username"],
+        extra={
+            "event": "group_member_added",
+            "trigger": "command",
+            "outcome": "success",
+            "actor": {
+                "discord_id": interaction.user.id,
+                "discord_name": interaction.user.name,
+                "kc_id": actor["id"],
+                "kc_username": actor["username"],
+            },
+            "target": {
+                "discord_id": user.id,
+                "discord_name": user.name,
+                "kc_id": target["id"],
+                "kc_username": target["username"],
+            },
+            "group": {"path": group, "kc_id": group_id},
+        },
+    )
+    await interaction.followup.send(f"Added {user.mention} to `{group}`{role_note}.")
 
 
-@DiscordClient.tree.command(name="revoke", description="Remove a user from a Keycloak group")
+@DiscordClient.tree.command(
+    name="revoke", description="Remove a user from a Keycloak group"
+)
 @app_commands.describe(user="The user to remove", group="The Keycloak group to revoke")
 @app_commands.autocomplete(group=group_autocomplete)
 async def revoke(interaction: discord.Interaction, user: discord.User, group: str):
     await interaction.response.defer(ephemeral=True)
 
     if GrantRules is None:
-        await interaction.followup.send("Grant rules aren't loaded yet, try again shortly.")
+        await interaction.followup.send(
+            "Grant rules aren't loaded yet, try again shortly."
+        )
         return
 
     if group not in GrantRules.rules:
@@ -458,29 +717,71 @@ async def revoke(interaction: discord.Interaction, user: discord.User, group: st
 
     actor_groups = await asyncio.to_thread(get_user_group_paths, actor["id"])
     if not GrantRules.can_grant(actor_groups, group):
+        logger.warning(
+            "%s attempted to revoke %s but is not authorized",
+            interaction.user.name, group,
+            extra={
+                "event": "authz_denied",
+                "trigger": "command",
+                "actor": {
+                    "discord_id": interaction.user.id,
+                    "discord_name": interaction.user.name,
+                    "kc_id": actor["id"],
+                    "kc_username": actor["username"],
+                },
+                "group": {"path": group},
+            },
+        )
         await interaction.followup.send(f"You're not authorized to revoke `{group}`.")
         return
 
     target = await asyncio.to_thread(lookup_keycloak_user, user.id)
     if target is None:
-        await interaction.followup.send(f"{user.mention} has no linked Keycloak account.")
+        await interaction.followup.send(
+            f"{user.mention} has no linked Keycloak account."
+        )
         return
 
     group_id = GrantRules.group_ids[group]
     await asyncio.to_thread(
-        KeycloakClient.group_user_remove, user_id=target["id"], group_id=group_id)
+        KeycloakClient.group_user_remove, user_id=target["id"], group_id=group_id
+    )
+    role_note = await apply_linked_role(group_id, user, add=False)
 
-    logger.info("%s (%s) revoked %s from %s (%s)",
-                actor["username"], interaction.user.name, group, target["username"], user.name)
-    await interaction.followup.send(f"Removed {user.mention} from `{group}`.")
+    logger.info(
+        "%s revoked %s from %s", actor["username"], group, target["username"],
+        extra={
+            "event": "group_member_removed",
+            "trigger": "command",
+            "outcome": "success",
+            "actor": {
+                "discord_id": interaction.user.id,
+                "discord_name": interaction.user.name,
+                "kc_id": actor["id"],
+                "kc_username": actor["username"],
+            },
+            "target": {
+                "discord_id": user.id,
+                "discord_name": user.name,
+                "kc_id": target["id"],
+                "kc_username": target["username"],
+            },
+            "group": {"path": group, "kc_id": group_id},
+        },
+    )
+    await interaction.followup.send(f"Removed {user.mention} from `{group}`{role_note}.")
 
 
-@DiscordClient.tree.command(name="grants", description="List the groups you're allowed to grant")
+@DiscordClient.tree.command(
+    name="grants", description="List the groups you're allowed to grant"
+)
 async def grants(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     if GrantRules is None:
-        await interaction.followup.send("Grant rules aren't loaded yet, try again shortly.")
+        await interaction.followup.send(
+            "Grant rules aren't loaded yet, try again shortly."
+        )
         return
 
     actor = await asyncio.to_thread(lookup_keycloak_user, interaction.user.id)
@@ -490,7 +791,8 @@ async def grants(interaction: discord.Interaction):
 
     actor_groups = await asyncio.to_thread(get_user_group_paths, actor["id"])
     allowed = [
-        group for group in GrantRules.grantable_groups()
+        group
+        for group in GrantRules.grantable_groups()
         if GrantRules.can_grant(actor_groups, group)
     ]
 
@@ -502,4 +804,6 @@ async def grants(interaction: discord.Interaction):
     await interaction.followup.send(f"You can grant:\n{listing}")
 
 
-DiscordClient.run(token=os.environ["DISCORD_BOT_TOKEN"], log_handler=handler, log_formatter=formatter)
+DiscordClient.run(
+    token=os.environ["DISCORD_BOT_TOKEN"], log_handler=handler, log_formatter=JsonFormatter()
+)

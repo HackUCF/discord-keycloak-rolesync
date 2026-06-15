@@ -11,7 +11,10 @@ match Keycloak — to change who has access, change it in Keycloak (admin UI or 
 below).
 
 For this to work you need to:
-1. Implement the [Discord Keycloak Identity Provider](https://github.com/wadahiro/keycloak-discord)
+1. Give each Keycloak user a `discord_id` custom user attribute holding their Discord user ID. The
+   bot matches users to Discord by this attribute (searched via `q=discord_id:<id>`); a user with no
+   `discord_id` is treated as unlinked. (Alternatively, populate it automatically with the [Discord
+   Keycloak Identity Provider](https://github.com/wadahiro/keycloak-discord).)
 2. Set up the Keycloak groups you'd like to project with the following attributes:
    - `discord-role` containing the ID of the role (requires dev mode for Discord to be enabled)
    - `discord-guild` containing the ID of the guild the role is in
@@ -59,12 +62,12 @@ grants:
       - "/infra/infra-director"
 ```
 
-> [!IMPORTANT]
-> A grant-managed group must **not** have the `discord-role`/`discord-guild` attributes. A group is
-> either role-synced (projected onto a Discord role) or grant-managed (membership-only, written by
-> the commands); never both. A group that is both would be claimed by the projection sync and
-> excluded from the grant rules — so such entries are skipped with a warning at startup.
+A grantable group **may also be role-synced** (carry `discord-role`/`discord-guild`). Because
+Keycloak is the system of record, the two compose: `/grant` writes the user into the Keycloak
+group, and the projection then applies the linked Discord role (the command also applies it
+immediately so the user doesn't wait for the next poll). So `/grant @bob /BEANS` adds Bob to
+`/BEANS` and gives him the role tied to it; `/revoke` reverses both.
 
 Both the grantable group and its granters are resolved against Keycloak at startup; typos or
-non-existent paths are logged and skipped rather than crashing the bot. See `grants.yaml` for a
-full sample.
+non-existent paths are logged and skipped rather than crashing the bot. See `example-grants.yaml`
+for a full sample (copy it to `grants.yaml` and point `GRANTS_CONFIG` at it).

@@ -1,9 +1,10 @@
 # Grant rules: who may add/remove users from which Keycloak groups via the
 # /grant and /revoke slash commands.
 #
-# - `group`      : the Keycloak group path that can be granted (must NOT be a
-#                  role-synced group, i.e. it must not carry the discord-role
-#                  attribute -- a group is either role-synced or grant-managed).
+# - `group`      : the Keycloak group path that can be granted. It MAY also be a
+#                  role-synced group (carry a discord-role attribute): granting
+#                  adds Keycloak membership and the projection then applies the
+#                  linked Discord role.
 # - `granted_by` : Keycloak group paths whose members are allowed to grant it.
 #                  Model rotating roles (e.g. "Infra Director") as a Keycloak
 #                  group with one member rather than hardcoding a person here.
@@ -12,11 +13,6 @@
 # typically kept populated from Discord roles by the existing role-sync.
 
 grants:
-  - group: "/infra/infra-developers"
+  - group: "/BEANS"
     granted_by:
-      - "/execs"
-      - "/infra/infra-director"
-
-  - group: "/marketing/contributors"
-    granted_by:
-      - "/execs"
+      - "/netbird-group"
